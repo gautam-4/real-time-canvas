@@ -1,166 +1,339 @@
+// app/page.tsx
 'use client';
 
-import { useState } from 'react';
-import styled from 'styled-components';
-import { Brush, Eraser, Trash, Sliders, Palette } from 'lucide-react'; // Importing necessary icons
+import { useState, useRef, useEffect, useCallback } from 'react';
+import { Brush, Eraser, Trash, Sliders, Palette } from 'lucide-react';
+import { supabase } from '@/utils/supabase';
 
-// Define styled components
-const CanvasContainer = styled.div`
-  position: relative;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  height: 100vh;
-  width: 100vw;
-  background-color: white;
-  background-image: linear-gradient(rgba(200, 200, 200, 0.3) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(200, 200, 200, 0.3) 1px, transparent 1px);
-  background-size: 20px 20px;
-  background-repeat: repeat;
-`;
+interface DrawEvent {
+  event_type: 'draw' | 'clear';
+  properties: {
+    type: 'brush' | 'eraser';
+    color: string;
+    size: number;
+    points: { x: number; y: number }[];
+    isNewStroke?: boolean;
+  };
+}
 
-const Header = styled.header`
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  width: 100%;
-  padding: 10px 20px;
-  background-color: #f4f4f4;
-  border-bottom: 2px solid #ddd;
-`;
+interface Dimensions {
+  width: number;
+  height: number;
+}
 
-const Logo = styled.div`
-  display: flex;
-  align-items: center;
-  font-size: 24px;
-  font-weight: bold;
-`;
-
-const Toolbar = styled.div`
-  display: flex;
-  align-items: center;
-  gap: 15px;
-`;
-
-const Button = styled.button`
-  padding: 8px;
-  font-size: 20px;
-  background: none;
-  border: none;
-  cursor: pointer;
-  transition: 0.3s;
-  &:hover {
-    opacity: 0.8;
-  }
-`;
-
-const Slider = styled.input`
-  width: 100px;
-`;
-
-const ColorInput = styled.input`
-  type: color;
-  padding: 5px;
-  font-size: 18px;
-`;
-
-// Rename the styled canvas component to StyledCanvas
-const StyledCanvas = styled.canvas`
-  border: 1px solid #ccc;
-  cursor: crosshair;
-  flex-grow: 1;
-`;
-
-// Main Home component
 export default function Home() {
-  const [isErasing, setIsErasing] = useState(false);
-  const [brushSize, setBrushSize] = useState(5);
-  const [brushColor, setBrushColor] = useState('#000000'); // Default color is black
+  // Tool states
+  const [selectedTool, setSelectedTool] = useState<'brush' | 'eraser'>('brush');
+  const [brushSize, setBrushSize] = useState<number>(5);
+  const [brushColor, setBrushColor] = useState<string>('#000000');
+  
+  // Drawing states
   const [isDrawing, setIsDrawing] = useState(false);
-  let ctx: CanvasRenderingContext2D | null = null;
+  const [currentStroke, setCurrentStroke] = useState<{ x: number; y: number }[]>([]);
+  
+  // Canvas states
+  const [dimensions, setDimensions] = useState<Dimensions>({ width: 0, height: 0 });
+  const [isLoaded, setIsLoaded] = useState(false);
+  const [isLoadingState, setIsLoadingState] = useState(true);
+  
+  // Refs
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
 
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!ctx) return;
-    setIsDrawing(true);
-    ctx.beginPath();
-    ctx.lineWidth = brushSize;
-    ctx.lineCap = 'round';
-    ctx.strokeStyle = isErasing ? 'white' : brushColor; // Set the brush color
-    ctx.moveTo(e.nativeEvent.offsetX, e.nativeEvent.offsetY);
-  };
+  // Initialize dimensions on client side
+  useEffect(() => {
+    const updateDimensions = () => {
+      setDimensions({
+        width: window.innerWidth,
+        height: window.innerHeight
+      });
+    };
 
-  const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
-    if (!ctx || !isDrawing) return;
-    ctx.lineTo(e.nativeEvent.offsetX, e.nativeEvent.offsetY);
-    ctx.stroke();
-  };
+    updateDimensions();
+    setIsLoaded(true);
 
-  const handleMouseUp = () => {
-    if (ctx) ctx.closePath();
-    setIsDrawing(false);
-  };
+    window.addEventListener('resize', updateDimensions);
+    return () => window.removeEventListener('resize', updateDimensions);
+  }, []);
 
-  const clearCanvas = (canvas: HTMLCanvasElement) => {
-    const context = canvas.getContext('2d');
-    if (context) {
-      context.clearRect(0, 0, canvas.width, canvas.height);
+  // Initialize canvas and Supabase subscription
+  useEffect(() => {
+    if (!canvasRef.current || !isLoaded || dimensions.width === 0) return;
+
+    // Set up canvas
+    const canvas = canvasRef.current;
+    canvas.width = dimensions.width;
+    canvas.height = dimensions.height;
+    
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    if (ctx) {
+      ctx.lineCap = 'round';
+      ctx.lineJoin = 'round';
+      ctxRef.current = ctx;
+    }
+
+    // Subscribe to real-time changes
+    const subscription = supabase
+      .channel('canvas_events')
+      .on(
+        'postgres_changes',
+        {
+          event: 'INSERT',
+          schema: 'public',
+          table: 'canvas_events',
+        },
+        (payload) => handleRealtimeUpdate(payload.new as DrawEvent)
+      )
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') {
+          console.log('Connected to Supabase realtime');
+        } else {
+          console.error('Failed to connect to Supabase realtime:', status);
+        }
+      });
+
+    // Load existing canvas state
+    loadCanvasState();
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, [dimensions, isLoaded]);
+
+  const loadCanvasState = async () => {
+    setIsLoadingState(true);
+    try {
+      const { data, error } = await supabase
+        .from('canvas_events')
+        .select('*')
+        .order('sequence_number', { ascending: true });
+
+      if (error) throw error;
+
+      // Replay all events
+      data.forEach((event: DrawEvent) => {
+        handleRealtimeUpdate(event);
+      });
+    } catch (error) {
+      console.error('Error loading canvas state:', error);
+    } finally {
+      setIsLoadingState(false);
     }
   };
 
+  const handleRealtimeUpdate = (event: DrawEvent) => {
+    if (!ctxRef.current) return;
+
+    const ctx = ctxRef.current;
+
+    if (event.event_type === 'clear') {
+      ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+      return;
+    }
+
+    const { type, color, size, points } = event.properties;
+    
+    ctx.strokeStyle = type === 'eraser' ? 'white' : color;
+    ctx.lineWidth = size;
+
+    if (points.length < 2) return;
+
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    
+    for (let i = 1; i < points.length; i++) {
+      ctx.lineTo(points[i].x, points[i].y);
+    }
+    
+    ctx.stroke();
+    ctx.closePath();
+  };
+
+  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+    setIsDrawing(true);
+    const point = { x: e.nativeEvent.offsetX, y: e.nativeEvent.offsetY };
+    setCurrentStroke([point]);
+  };
+
+  const handleMouseMove = useCallback(
+    (e: React.MouseEvent<HTMLCanvasElement>) => {
+      if (!isDrawing) return;
+      
+      const point = { 
+        x: e.nativeEvent.offsetX, 
+        y: e.nativeEvent.offsetY 
+      };
+      
+      setCurrentStroke(prev => [...prev, point]);
+
+      if (ctxRef.current) {
+        const ctx = ctxRef.current;
+        ctx.strokeStyle = selectedTool === 'eraser' ? 'white' : brushColor;
+        ctx.lineWidth = brushSize;
+        
+        if (currentStroke.length > 0) {
+          ctx.beginPath();
+          ctx.moveTo(currentStroke[currentStroke.length - 1].x, currentStroke[currentStroke.length - 1].y);
+          ctx.lineTo(point.x, point.y);
+          ctx.stroke();
+          ctx.closePath();
+        }
+      }
+    },
+    [isDrawing, selectedTool, brushColor, brushSize, currentStroke]
+  );
+
+  const handleMouseUp = async () => {
+    if (!isDrawing) return;
+    setIsDrawing(false);
+
+    // Send the complete stroke to Supabase
+    const drawEvent: DrawEvent = {
+      event_type: 'draw',
+      properties: {
+        type: selectedTool,
+        color: brushColor,
+        size: brushSize,
+        points: currentStroke,
+      },
+    };
+
+    const { error } = await supabase
+      .from('canvas_events')
+      .insert([drawEvent]);
+
+    if (error) {
+      console.error('Error saving draw event:', error);
+    }
+
+    setCurrentStroke([]);
+  };
+
+  const clearCanvas = async () => {
+    const clearEvent = {
+      event_type: 'clear',
+      properties: {
+        type: 'clear',
+        color: '',
+        size: 0,
+        points: [],
+      },
+    };
+
+    const { error } = await supabase
+      .from('canvas_events')
+      .insert([clearEvent]);
+
+    if (error) {
+      console.error('Error saving clear event:', error);
+    }
+  };
+
+  // Only render the canvas and toolbar when client-side is loaded
+  if (!isLoaded) {
+    return null;
+  }
+
   return (
-    <CanvasContainer>
-      <Header>
-        <Logo>
-          <Brush size={24} /> Brush App
-        </Logo>
-        <Toolbar>
-          <Button onClick={() => setIsErasing(false)}>
-            <Brush size={24} />
-          </Button>
-          <Button onClick={() => setIsErasing(true)}>
-            <Eraser size={24} />
-          </Button>
-          <Button
-            onClick={() => {
-              const canvas = document.querySelector('canvas');
-              if (canvas) clearCanvas(canvas);
-            }}
-          >
-            <Trash size={24} />
-          </Button>
-          <label>
-            <Sliders size={24} />
-            <Slider
-              type="range"
-              min="1"
-              max="50"
-              value={brushSize}
-              onChange={(e) => setBrushSize(Number(e.target.value))}
-            />
-          </label>
-          <label>
-            <Palette size={24} />
-            <ColorInput
-              type="color"
-              value={brushColor}
-              onChange={(e) => setBrushColor(e.target.value)} // Update brush color
-            />
-          </label>
-        </Toolbar>
-      </Header>
-      <StyledCanvas
-        width={window.innerWidth}
-        height={window.innerHeight - 50}
-        ref={(canvas) => {
-          if (canvas && !ctx) {
-            ctx = canvas.getContext('2d');
-          }
-        }}
+    <div className="relative h-screen w-screen">
+      {isLoadingState && (
+        <div className="absolute inset-0 bg-white bg-opacity-50 flex items-center justify-center z-20">
+          <div className="text-gray-800">Loading canvas...</div>
+        </div>
+      )}
+
+      {/* Floating Toolbar */}
+      <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-gray-100 bg-opacity-90 shadow-lg rounded-full flex items-center gap-4 px-6 py-2 z-10">
+        {/* Brush Tool */}
+        <button
+          className={`p-2 ${
+            selectedTool === 'brush' ? 'bg-black text-white' : 'text-gray-800 hover:text-black'
+          } rounded-full`}
+          onClick={() => setSelectedTool('brush')}
+          aria-label="Brush Tool"
+        >
+          <Brush size={24} />
+        </button>
+
+        {/* Eraser Tool */}
+        <button
+          className={`p-2 ${
+            selectedTool === 'eraser' ? 'bg-black text-white' : 'text-gray-800 hover:text-black'
+          } rounded-full`}
+          onClick={() => setSelectedTool('eraser')}
+          aria-label="Eraser Tool"
+        >
+          <Eraser size={24} />
+        </button>
+
+        {/* Clear Canvas */}
+        <button
+          className="p-2 text-gray-800 hover:text-black rounded-full"
+          onClick={clearCanvas}
+          aria-label="Clear Canvas"
+        >
+          <Trash size={24} />
+        </button>
+
+        {/* Brush Size Slider */}
+        <label className="flex items-center gap-2">
+          <Sliders size={24} />
+          <input
+            type="range"
+            min="1"
+            max="50"
+            value={brushSize}
+            onChange={(e) => setBrushSize(Number(e.target.value))}
+            className="w-20"
+          />
+        </label>
+
+        {/* Brush Color Picker */}
+        <label className="flex items-center gap-2">
+          <Palette size={24} />
+          <input
+            type="color"
+            value={brushColor}
+            onChange={(e) => setBrushColor(e.target.value)}
+            className="w-8 h-8 border-none outline-none"
+          />
+        </label>
+      </div>
+
+      {/* Canvas */}
+      <canvas
+        className="absolute top-0 left-0 w-full h-full cursor-crosshair z-0 bg-white"
+        ref={canvasRef}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
+        onMouseLeave={handleMouseUp}
+        onTouchStart={(e) => {
+          e.preventDefault();
+          const touch = e.touches[0];
+          const rect = canvasRef.current?.getBoundingClientRect();
+          if (!rect) return;
+          handleMouseDown({
+            nativeEvent: { 
+              offsetX: touch.clientX - rect.left,
+              offsetY: touch.clientY - rect.top
+            }
+          } as any);
+        }}
+        onTouchMove={(e) => {
+          e.preventDefault();
+          const touch = e.touches[0];
+          const rect = canvasRef.current?.getBoundingClientRect();
+          if (!rect) return;
+          handleMouseMove({
+            nativeEvent: {
+              offsetX: touch.clientX - rect.left,
+              offsetY: touch.clientY - rect.top
+            }
+          } as any);
+        }}
+        onTouchEnd={() => handleMouseUp()}
       />
-    </CanvasContainer>
+    </div>
   );
 }
-
