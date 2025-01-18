@@ -4,6 +4,7 @@
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Brush, Eraser, Trash, Sliders, Palette } from 'lucide-react';
 import { supabase } from '@/utils/supabase';
+import _ from 'lodash';
 
 interface DrawEvent {
   event_type: 'draw' | 'clear';
@@ -11,9 +12,14 @@ interface DrawEvent {
     type: 'brush' | 'eraser';
     color: string;
     size: number;
-    points: { x: number; y: number }[];
+    points: Point[];
     isNewStroke?: boolean;
   };
+}
+
+interface Point {
+  x: number;
+  y: number;
 }
 
 interface Dimensions {
@@ -29,7 +35,7 @@ export default function Home() {
   
   // Drawing states
   const [isDrawing, setIsDrawing] = useState(false);
-  const [currentStroke, setCurrentStroke] = useState<{ x: number; y: number }[]>([]);
+  const [currentStroke, setCurrentStroke] = useState<Point[]>([]);
   
   // Canvas states
   const [dimensions, setDimensions] = useState<Dimensions>({ width: 0, height: 0 });
@@ -40,20 +46,73 @@ export default function Home() {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const ctxRef = useRef<CanvasRenderingContext2D | null>(null);
 
+  // Handle real-time updates
+  const handleRealtimeUpdate = useCallback((event: DrawEvent) => {
+    if (!ctxRef.current) return;
+
+    const ctx = ctxRef.current;
+
+    if (event.event_type === 'clear') {
+      ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
+      return;
+    }
+
+    const { type, color, size, points } = event.properties;
+    
+    ctx.strokeStyle = type === 'eraser' ? 'white' : color;
+    ctx.lineWidth = size;
+
+    if (points.length < 2) return;
+
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    
+    for (let i = 1; i < points.length; i++) {
+      ctx.lineTo(points[i].x, points[i].y);
+    }
+    
+    ctx.stroke();
+    ctx.closePath();
+  }, []);
+
+  // Load canvas state
+  const loadCanvasState = useCallback(async () => {
+    setIsLoadingState(true);
+    try {
+      const { data, error } = await supabase
+        .from('canvas_events')
+        .select('*')
+        .order('sequence_number', { ascending: true });
+
+      if (error) throw error;
+
+      data?.forEach((event: DrawEvent) => {
+        handleRealtimeUpdate(event);
+      });
+    } catch (error) {
+      console.error('Error loading canvas state:', error);
+    } finally {
+      setIsLoadingState(false);
+    }
+  }, [handleRealtimeUpdate]);
+
   // Initialize dimensions on client side
   useEffect(() => {
-    const updateDimensions = () => {
+    const updateDimensions = _.debounce(() => {
       setDimensions({
         width: window.innerWidth,
         height: window.innerHeight
       });
-    };
+    }, 250);
 
     updateDimensions();
     setIsLoaded(true);
 
     window.addEventListener('resize', updateDimensions);
-    return () => window.removeEventListener('resize', updateDimensions);
+    return () => {
+      window.removeEventListener('resize', updateDimensions);
+      updateDimensions.cancel();
+    };
   }, []);
 
   // Initialize canvas and Supabase subscription
@@ -86,7 +145,9 @@ export default function Home() {
       )
       .subscribe((status) => {
         if (status === 'SUBSCRIBED') {
-          console.log('Connected to Supabase realtime');
+          if (process.env.NODE_ENV === 'development') {
+            console.log('Connected to Supabase realtime');
+          }
         } else {
           console.error('Failed to connect to Supabase realtime:', status);
         }
@@ -97,63 +158,25 @@ export default function Home() {
 
     return () => {
       subscription.unsubscribe();
+      setIsDrawing(false);
+      setCurrentStroke([]);
     };
-  }, [dimensions, isLoaded]);
+  }, [dimensions, isLoaded, handleRealtimeUpdate, loadCanvasState]);
 
-  const loadCanvasState = async () => {
-    setIsLoadingState(true);
-    try {
-      const { data, error } = await supabase
-        .from('canvas_events')
-        .select('*')
-        .order('sequence_number', { ascending: true });
-
-      if (error) throw error;
-
-      // Replay all events
-      data.forEach((event: DrawEvent) => {
-        handleRealtimeUpdate(event);
-      });
-    } catch (error) {
-      console.error('Error loading canvas state:', error);
-    } finally {
-      setIsLoadingState(false);
+  // Handle loading state
+  useEffect(() => {
+    if (isLoadingState) {
+      document.body.style.cursor = 'wait';
+    } else {
+      document.body.style.cursor = 'default';
     }
-  };
+  }, [isLoadingState]);
 
-  const handleRealtimeUpdate = (event: DrawEvent) => {
-    if (!ctxRef.current) return;
-
-    const ctx = ctxRef.current;
-
-    if (event.event_type === 'clear') {
-      ctx.clearRect(0, 0, ctx.canvas.width, ctx.canvas.height);
-      return;
-    }
-
-    const { type, color, size, points } = event.properties;
-    
-    ctx.strokeStyle = type === 'eraser' ? 'white' : color;
-    ctx.lineWidth = size;
-
-    if (points.length < 2) return;
-
-    ctx.beginPath();
-    ctx.moveTo(points[0].x, points[0].y);
-    
-    for (let i = 1; i < points.length; i++) {
-      ctx.lineTo(points[i].x, points[i].y);
-    }
-    
-    ctx.stroke();
-    ctx.closePath();
-  };
-
-  const handleMouseDown = (e: React.MouseEvent<HTMLCanvasElement>) => {
+  const handleMouseDown = useCallback((e: React.MouseEvent<HTMLCanvasElement>) => {
     setIsDrawing(true);
     const point = { x: e.nativeEvent.offsetX, y: e.nativeEvent.offsetY };
     setCurrentStroke([point]);
-  };
+  }, []);
 
   const handleMouseMove = useCallback(
     (e: React.MouseEvent<HTMLCanvasElement>) => {
@@ -183,7 +206,7 @@ export default function Home() {
     [isDrawing, selectedTool, brushColor, brushSize, currentStroke]
   );
 
-  const handleMouseUp = async () => {
+  const handleMouseUp = useCallback(async () => {
     if (!isDrawing) return;
     setIsDrawing(false);
 
@@ -198,38 +221,61 @@ export default function Home() {
       },
     };
 
-    const { error } = await supabase
-      .from('canvas_events')
-      .insert([drawEvent]);
+    try {
+      const { error } = await supabase
+        .from('canvas_events')
+        .insert([drawEvent]);
 
-    if (error) {
+      if (error) throw error;
+    } catch (error) {
       console.error('Error saving draw event:', error);
     }
 
     setCurrentStroke([]);
-  };
+  }, [isDrawing, selectedTool, brushColor, brushSize, currentStroke]);
 
-  const clearCanvas = async () => {
-    const clearEvent = {
+  const clearCanvas = useCallback(async () => {
+    const clearEvent: DrawEvent = {
       event_type: 'clear',
       properties: {
-        type: 'clear',
+        type: 'brush',
         color: '',
         size: 0,
         points: [],
       },
     };
 
-    const { error } = await supabase
-      .from('canvas_events')
-      .insert([clearEvent]);
+    try {
+      const { error } = await supabase
+        .from('canvas_events')
+        .insert([clearEvent]);
 
-    if (error) {
+      if (error) throw error;
+    } catch (error) {
       console.error('Error saving clear event:', error);
     }
-  };
+  }, []);
 
-  // Only render the canvas and toolbar when client-side is loaded
+  // Handle touch events
+  const handleTouchEvent = useCallback((
+    e: React.TouchEvent<HTMLCanvasElement>,
+    handler: (e: React.MouseEvent<HTMLCanvasElement>) => void
+  ) => {
+    e.preventDefault();
+    const touch = e.touches[0];
+    const rect = canvasRef.current?.getBoundingClientRect();
+    if (!rect) return;
+    
+    const mouseEvent = {
+      nativeEvent: { 
+        offsetX: touch.clientX - rect.left,
+        offsetY: touch.clientY - rect.top
+      }
+    } as React.MouseEvent<HTMLCanvasElement>;
+    
+    handler(mouseEvent);
+  }, []);
+
   if (!isLoaded) {
     return null;
   }
@@ -244,38 +290,34 @@ export default function Home() {
 
       {/* Floating Toolbar */}
       <div className="absolute top-4 left-1/2 transform -translate-x-1/2 bg-gray-100 bg-opacity-90 shadow-lg rounded-full flex items-center gap-4 px-6 py-2 z-10">
-        {/* Brush Tool */}
         <button
           className={`p-2 ${
             selectedTool === 'brush' ? 'bg-black text-white' : 'text-gray-800 hover:text-black'
-          } rounded-full`}
+          } rounded-full transition-colors`}
           onClick={() => setSelectedTool('brush')}
           aria-label="Brush Tool"
         >
           <Brush size={24} />
         </button>
 
-        {/* Eraser Tool */}
         <button
           className={`p-2 ${
             selectedTool === 'eraser' ? 'bg-black text-white' : 'text-gray-800 hover:text-black'
-          } rounded-full`}
+          } rounded-full transition-colors`}
           onClick={() => setSelectedTool('eraser')}
           aria-label="Eraser Tool"
         >
           <Eraser size={24} />
         </button>
 
-        {/* Clear Canvas */}
         <button
-          className="p-2 text-gray-800 hover:text-black rounded-full"
+          className="p-2 text-gray-800 hover:text-black rounded-full transition-colors"
           onClick={clearCanvas}
           aria-label="Clear Canvas"
         >
           <Trash size={24} />
         </button>
 
-        {/* Brush Size Slider */}
         <label className="flex items-center gap-2">
           <Sliders size={24} />
           <input
@@ -288,7 +330,6 @@ export default function Home() {
           />
         </label>
 
-        {/* Brush Color Picker */}
         <label className="flex items-center gap-2">
           <Palette size={24} />
           <input
@@ -302,37 +343,15 @@ export default function Home() {
 
       {/* Canvas */}
       <canvas
-        className="absolute top-0 left-0 w-full h-full cursor-crosshair z-0 bg-white"
+        className="absolute top-0 left-0 w-full h-full cursor-crosshair z-0 bg-white touch-none"
         ref={canvasRef}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
-        onTouchStart={(e) => {
-          e.preventDefault();
-          const touch = e.touches[0];
-          const rect = canvasRef.current?.getBoundingClientRect();
-          if (!rect) return;
-          handleMouseDown({
-            nativeEvent: { 
-              offsetX: touch.clientX - rect.left,
-              offsetY: touch.clientY - rect.top
-            }
-          } as any);
-        }}
-        onTouchMove={(e) => {
-          e.preventDefault();
-          const touch = e.touches[0];
-          const rect = canvasRef.current?.getBoundingClientRect();
-          if (!rect) return;
-          handleMouseMove({
-            nativeEvent: {
-              offsetX: touch.clientX - rect.left,
-              offsetY: touch.clientY - rect.top
-            }
-          } as any);
-        }}
-        onTouchEnd={() => handleMouseUp()}
+        onTouchStart={(e) => handleTouchEvent(e, handleMouseDown)}
+        onTouchMove={(e) => handleTouchEvent(e, handleMouseMove)}
+        onTouchEnd={handleMouseUp}
       />
     </div>
   );
