@@ -1,6 +1,5 @@
 'use client';
 
-import { useRef, useEffect } from 'react';
 import type { Point } from '../types';
 
 interface CanvasProps {
